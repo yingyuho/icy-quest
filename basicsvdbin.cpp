@@ -1,12 +1,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <signal.h>
+#include <unistd.h>
 #include "record.hpp"
 
 #define USR_NUM 458293
 #define MOV_NUM 17770
 
-#define FET_NUM 40
+#define FET_NUM 100
 
 #define USR_LEN (FET_NUM * USR_NUM)
 #define MOV_LEN (FET_NUM * MOV_NUM)
@@ -18,9 +20,28 @@
 
 #define KAVG 25
 
+#define REC_BATCH 512
+
+static bool sigint = false;
+
+void sig_handler(int signo) {
+    switch (signo) {
+    case SIGINT:
+        sigint = true;
+        break;
+    default:
+        exit(1);
+        break;
+    }
+}
+
+inline size_t batch_read_record(struct record *r, FILE *f) {
+    return fread(r, sizeof(struct record), REC_BATCH, f);
+}
+
 int main (int argc, char *argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s trainFile [qualFile]\n", argv[0]);
+    if (argc < 3) {
+        printf("Usage: %s trainFile validFile [qualFile]\n", argv[0]);
         return 0;
     }
 
@@ -42,18 +63,24 @@ int main (int argc, char *argv[]) {
         movFeature[i] = 0.1 * float(rand()) / float(RAND_MAX);
 
     FILE *trainFile = fopen(argv[1], "rb");
+    FILE *validFile = fopen(argv[2], "rb");
 
     char *lineBuf = NULL;
     size_t lineLen = 0;
     char *endptr;
 
-    struct record rec;
+    struct record rBuf[REC_BATCH];
+    size_t recNum;
 
-    unsigned int ratingSum = 0, ratingNum = 0, trainEntryNum = 0;
+    unsigned int ratingSum = 0, ratingNum = 0;
+    unsigned int trainEntryNum = 0, validEntryNum = 0;
 
     fprintf(stderr, "Computing movie rating means...\n");
 
-    while (fread(&rec, sizeof(struct record), 1, trainFile)) {
+    while ((recNum = batch_read_record(rBuf, trainFile)))
+    for (int ri = 0; ri < recNum; ri++) {
+        struct record &rec = rBuf[ri];
+
         ratingSum += rec.r;
         ++ratingNum;
 
@@ -76,7 +103,9 @@ int main (int argc, char *argv[]) {
 
     rewind(trainFile);
 
-    while (fread(&rec, sizeof(struct record), 1, trainFile)) {
+    while ((recNum = batch_read_record(rBuf, trainFile)))
+    for (int ri = 0; ri < recNum; ri++) {
+        struct record &rec = rBuf[ri];
         userOffset[rec.u] += rec.r - movieMean[rec.m];
         ++userNum[rec.u];
     }
@@ -86,14 +115,36 @@ int main (int argc, char *argv[]) {
         // printf("%d %f\n", userNum[i], userOffset[i]);
     }
 
-    for (int t = 0; t < 50; t++) {
+    fseek(validFile, 0L, SEEK_END);
+    validEntryNum = ftell(validFile) / sizeof(struct record);
+
+    if (signal(SIGINT, sig_handler) == SIG_ERR)
+        printf("Cannot catch SIGINT\n");
+
+    FILE *usrFile, *movFile;
+
+    // usrFile = fopen("usrfeat.bin", "rb");
+    // movFile = fopen("movfeat.bin", "rb");
+
+    // fread(usrFeature, sizeof(float), USR_LEN, usrFile);
+    // fread(movFeature, sizeof(float), MOV_LEN, movFile);
+
+    // fclose(usrFile);
+    // fclose(movFile);
+
+    for (int t = 0; t < 85; t++) {
+        if (sigint)
+            break;
+
         fprintf(stderr, "Pass #%d...\n", t);
 
         rewind(trainFile);
 
         double rmse = 0.0;
 
-        while (fread(&rec, sizeof(struct record), 1, trainFile)) {
+        while ((recNum = batch_read_record(rBuf, trainFile)))
+        for (int ri = 0; ri < recNum; ri++) {
+            struct record &rec = rBuf[ri];
             float * const usrRow = usrFeature + FET_NUM * rec.u;
             float * const movRow = movFeature + FET_NUM * rec.m;
 
@@ -113,25 +164,47 @@ int main (int argc, char *argv[]) {
 
         rmse = sqrt(rmse / trainEntryNum);
 
-        fprintf(stderr, "RMSE = %.4f\n", rmse);
+        fprintf(stderr, "RMSE(Train) = %.4f\n", rmse);
+
+        rmse = 0.0;
+
+        rewind(validFile);
+
+        while ((recNum = batch_read_record(rBuf, validFile)))
+        for (int ri = 0; ri < recNum; ri++) {
+            struct record &rec = rBuf[ri];
+            float * const usrRow = usrFeature + FET_NUM * rec.u;
+            float * const movRow = movFeature + FET_NUM * rec.m;
+
+            float error = rec.r - (movieMean[rec.m] + userOffset[rec.u]);
+
+            for (int i = 0; i < FET_NUM; i++)
+                error -= usrRow[i] * movRow[i];
+
+            rmse += error * error;
+        }
+
+        rmse = sqrt(rmse / validEntryNum);
+
+        fprintf(stderr, "RMSE(Valid) = %.4f\n", rmse);
     }
 
-    FILE *usrFile = fopen("usrfeat.bin", "wb");
-    FILE *movFile = fopen("movfeat.bin", "wb");
+    // usrFile = fopen("usrfeat.bin", "wb");
+    // movFile = fopen("movfeat.bin", "wb");
 
-    fwrite(usrFeature, sizeof(float), USR_LEN, usrFile);
-    fwrite(movFeature, sizeof(float), MOV_LEN, movFile);
+    // fwrite(usrFeature, sizeof(float), USR_LEN, usrFile);
+    // fwrite(movFeature, sizeof(float), MOV_LEN, movFile);
 
-    fclose(usrFile);
-    fclose(movFile);
+    // fclose(usrFile);
+    // fclose(movFile);
 
 
     FILE *qualFile = NULL;
 
-    if (argc >= 3) {
+    if (argc >= 4) {
         fprintf(stderr, "Predicting qual ratings...\n");
 
-        qualFile = fopen(argv[2], "r");
+        qualFile = fopen(argv[3], "r");
 
         while (getline(&lineBuf, &lineLen, qualFile) != -1) {
             unsigned int usrID = strtoul(lineBuf, &endptr, 10) - 1;
@@ -145,6 +218,11 @@ int main (int argc, char *argv[]) {
 
             for (int i = 0; i < FET_NUM; i++)
                 pred += usrRow[i] * movRow[i];
+
+            if (pred < 1.0)
+                pred = 1.0;
+            if (pred > 5.0)
+                pred = 5.0;
 
             printf("%.3f\n", pred);
         }
@@ -162,4 +240,6 @@ int main (int argc, char *argv[]) {
     return 0;
 }
 
-// Your current submission RMSE: 0.9223 (3.06% above water)
+// F =  40, T = 75: 0.91741 (3.57% above water)
+// F = 100, T = 73: 0.91332 (4.00% above water)
+
